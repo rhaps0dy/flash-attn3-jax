@@ -1,0 +1,84 @@
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+
+from .varlen_bwd import flash_mha_varlen_bwd
+from .varlen_fwd import flash_mha_varlen_fwd
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(6,))
+def _flash_mha_varlen_vjp(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    cu_seqlens_q: jax.Array,
+    cu_seqlens_k: jax.Array,
+    seqused_k: jax.Array,
+    config: dict,
+):
+    return flash_mha_varlen_fwd(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k, **config
+    )[0]
+
+
+def _flash_mha_varlen_vjp_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k, config):
+    out, lse = flash_mha_varlen_fwd(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k, **config
+    )
+    return out, (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k, out, lse)
+
+
+def _flash_mha_varlen_vjp_bwd(config, pack, dout):
+    (q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k, out, lse) = pack
+    if seqused_k is not None:
+        # the bwd doesn't support seqused_k directly
+        # instead, we use a mask to zero out K and V on the input, and DK and DV on the result
+        starts = cu_seqlens_k[:-1]
+        ends = cu_seqlens_k[1:]
+        lens = ends - starts
+        zero = jnp.zeros(q.shape[0], dtype=jnp.int32)
+        ixl = jnp.arange(q.shape[0]) - jnp.cumsum(zero.at[ends].add(lens))
+        limits = jnp.cumsum(
+            zero.at[starts].add(
+                seqused_k - jnp.concatenate([jnp.array([0]), seqused_k[:-1]])
+            )
+        )
+        mask = ixl < limits
+        v = v * mask[:, None, None]
+        k = k * mask[:, None, None]
+    dq, dk, dv = flash_mha_varlen_bwd(
+        dout, q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, **config
+    )
+    if seqused_k is not None:
+        dk = dk * mask[:, None, None]
+        dv = dv * mask[:, None, None]
+    return (dq, dk, dv, None, None, None)
+
+
+_flash_mha_varlen_vjp.defvjp(_flash_mha_varlen_vjp_fwd, _flash_mha_varlen_vjp_bwd)
+
+
+def flash_mha_varlen(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k=None,
+    seqused_k=None,
+    max_seqlen_q: int = -1,
+    max_seqlen_k: int = -1,
+    softmax_scale: float | None = None,
+    is_causal: bool = False,
+    window_size: tuple = (-1, -1),
+):
+    if cu_seqlens_k is None:
+        cu_seqlens_k = cu_seqlens_q
+    config = dict(
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        is_causal=is_causal,
+        window_size=window_size,
+    )
+    return _flash_mha_varlen_vjp(q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k, config)

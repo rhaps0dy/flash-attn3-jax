@@ -1,0 +1,97 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.8.0",
+    "packaging",
+    "psutil",
+    "pybind11>=2.11.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "flash-attn3-jax"
+dynamic = ["version"]
+description = "FlashAttention-3 JAX binding using XLA FFI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "BSD-3-Clause" }
+dependencies = [
+    "jax>=0.5.0, <=0.7.0",
+    "einops",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: Unix",
+]
+
+[dependency-groups]
+test = [
+    "pytest>=7.0.0",
+    "flax",
+    "jax[cuda12]==0.7.*",
+    "ipykernel",
+    "pip"
+]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "F",   # pyflakes (includes unused imports)
+    "PTH", # flake8-use-pathlib
+    "UP",  # pyupgrade
+    "I",   # isort
+] 
+ignore = [
+    "F722",  # forward reference syntax error
+]
+
+[tool.scikit-build]
+wheel.expand-macos-universal-tags = false
+cmake.version = ">=3.26.1"
+ninja.version = ">=1.11"
+build.verbose = true
+cmake.build-type = "Release"
+cmake.args = []
+
+[tool.scikit-build.cmake.define]
+SKBUILD = "ON"
+CMAKE_VERBOSE_MAKEFILE = "ON"
+CMAKE_CUDA_FLAGS = "--threads 0"
+# CUDA architecture configuration (SM80=Ampere, SM90=Hopper)
+FLASH_ATTN_CUDA_ARCHS = { env = "FLASH_ATTN_CUDA_ARCHS", default = "90" }
+# Feature flags to reduce build time and binary size
+# Core feature flags
+FLASHATTENTION_DISABLE_BACKWARD = { env = "FLASHATTENTION_DISABLE_BACKWARD", default = "OFF" }
+FLASHATTENTION_DISABLE_SPLIT = { env = "FLASHATTENTION_DISABLE_SPLIT", default = "OFF" }
+FLASHATTENTION_DISABLE_PAGEDKV = { env = "FLASHATTENTION_DISABLE_PAGEDKV", default = "OFF" }
+FLASHATTENTION_DISABLE_APPENDKV = { env = "FLASHATTENTION_DISABLE_APPENDKV", default = "OFF" }
+FLASHATTENTION_DISABLE_LOCAL = { env = "FLASHATTENTION_DISABLE_LOCAL", default = "OFF" }
+FLASHATTENTION_DISABLE_SOFTCAP = { env = "FLASHATTENTION_DISABLE_SOFTCAP", default = "OFF" }
+FLASHATTENTION_DISABLE_PACKGQA = { env = "FLASHATTENTION_DISABLE_PACKGQA", default = "OFF" }
+# Data type flags
+FLASHATTENTION_DISABLE_FP16 = { env = "FLASHATTENTION_DISABLE_FP16", default = "OFF" }
+FLASHATTENTION_DISABLE_FP8 = { env = "FLASHATTENTION_DISABLE_FP8", default = "OFF" }
+# Architecture flags
+FLASHATTENTION_DISABLE_SM8x = { env = "FLASHATTENTION_DISABLE_SM8x", default = "ON" }
+FLASHATTENTION_DISABLE_SM90 = { env = "FLASHATTENTION_DISABLE_SM90", default = "OFF" }
+# Variable length sequence support
+FLASHATTENTION_DISABLE_VARLEN = { env = "FLASHATTENTION_DISABLE_VARLEN", default = "OFF" }
+# Head dimension flags
+FLASHATTENTION_DISABLE_HDIM64 = { env = "FLASHATTENTION_DISABLE_HDIM64", default = "OFF" }
+FLASHATTENTION_DISABLE_HDIM96 = { env = "FLASHATTENTION_DISABLE_HDIM96", default = "OFF" }
+FLASHATTENTION_DISABLE_HDIM128 = { env = "FLASHATTENTION_DISABLE_HDIM128", default = "OFF" }
+FLASHATTENTION_DISABLE_HDIM192 = { env = "FLASHATTENTION_DISABLE_HDIM192", default = "OFF" }
+FLASHATTENTION_DISABLE_HDIM256 = { env = "FLASHATTENTION_DISABLE_HDIM256", default = "OFF" }
+# Different Q/KV head dimension support
+FLASHATTENTION_DISABLE_HDIMDIFF64 = { env = "FLASHATTENTION_DISABLE_HDIMDIFF64", default = "OFF" }
+FLASHATTENTION_DISABLE_HDIMDIFF192 = { env = "FLASHATTENTION_DISABLE_HDIMDIFF192", default = "OFF" }
+# Others
+FLASHATTENTION_DISABLE_CLUSTER = { env = "FLASHATTENTION_DISABLE_CLUSTER", default = "OFF" }
+FLASHATTENTION_ENABLE_VCOLMAJOR = { env = "FLASHATTENTION_ENABLE_VCOLMAJOR", default = "OFF" }
+
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "src/flash_attn3_jax/__init__.py"

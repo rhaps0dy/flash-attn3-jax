@@ -1,0 +1,341 @@
+import math
+from functools import partial
+
+import flash_attn3_jax_lib.flash_api as flash_api
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import dtypes
+from jax.core import ShapedArray
+from jax.extend.core import Primitive
+from jax.interpreters import mlir, xla
+from jax.interpreters.mlir import ir
+
+_flash_mha_fwd_hlo_p = Primitive("flash_mha_fwd_hlo")
+_flash_mha_fwd_hlo_p.multiple_results = True
+_flash_mha_fwd_hlo_p.def_impl(partial(xla.apply_primitive, _flash_mha_fwd_hlo_p))
+
+_flash_mha_bwd_hlo_p = Primitive("flash_mha_bwd_hlo")
+_flash_mha_bwd_hlo_p.multiple_results = True
+_flash_mha_bwd_hlo_p.def_impl(partial(xla.apply_primitive, _flash_mha_bwd_hlo_p))
+
+
+def _flash_mha_fwd_hlo(q, k, v, softmax_scale, is_causal, window_size):
+    out, lse = _flash_mha_fwd_hlo_p.bind(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        is_causal=is_causal,
+        window_size=window_size,
+    )
+    return out, lse
+
+
+def _flash_mha_bwd_hlo(dout, q, k, v, out, lse, softmax_scale, is_causal, window_size):
+    dq, dk, dv = _flash_mha_bwd_hlo_p.bind(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale=softmax_scale,
+        is_causal=is_causal,
+        window_size=window_size,
+    )
+    return dq, dk, dv
+
+
+# Register functions defined in gpu_ops as custom call target for GPUs
+for _name, _value in flash_api.get_ffi_registrations().items():
+    jax.ffi.register_ffi_target(_name, _value, platform="CUDA")
+
+
+def ir_type_to_dtype(ty):
+    for dtype in [np.dtype("bfloat16"), np.dtype("float16"), np.dtype("float32")]:
+        if ty == mlir.dtype_to_ir_type(dtype):
+            return dtype
+
+
+def _flash_mha_fwd_hlo_lowering(
+    ctx, q, k, v, softmax_scale=None, is_causal=False, window_size=None
+):
+    q_type = ir.RankedTensorType(q.type)
+    q_shape = q_type.shape
+    k_type = ir.RankedTensorType(k.type)
+    k_shape = k_type.shape
+    v_type = ir.RankedTensorType(v.type)
+    v_shape = v_type.shape
+
+    assert q_type.element_type == k_type.element_type, (
+        "Q and K must have the same dtype"
+    )
+    assert q_type.element_type == v_type.element_type, (
+        "Q and V must have the same dtype"
+    )
+    element_type = q_type.element_type
+    assert type(element_type) in [ir.F16Type, ir.BF16Type], (
+        "Only support fp16 and bf16 data type"
+    )
+    [n, l, h, d] = q_shape
+    [nk, lk, hk, dk] = k_shape
+    assert k_shape == v_shape, "K and V must have the same shape"
+    assert [n, d] == [nk, dk], "Q and K must have the same batch size and head size"
+    assert isinstance(window_size, (tuple, list))
+
+    def fwd(q, k, v):
+        dpad = (8 - d % 8) % 8
+        if dpad > 0:
+            # We need padding. It's better to let xla's allocator handle it here than directly call cudaMalloc.
+            q = jnp.pad(q, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+            k = jnp.pad(k, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+            v = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+
+        # q_shape = [n, l, h, d+dpad]
+        # k_shape = [n, lk, hk, d+dpad]
+        # v_shape = [n, lk, hk, d+dpad]
+        o_shape = [n, l, h, d + dpad]
+        lse_shape = [n, h, l]
+        # Empty accumulators for non-split mode
+        out_accum_shape = [1, 1, 1, 1]
+        lse_accum_shape = [1, 1, 1]
+
+        jax_dtype = jnp.bfloat16 if type(element_type) == ir.BF16Type else jnp.float16
+        out_types = [
+            jax.ShapeDtypeStruct(o_shape, jax_dtype),
+            jax.ShapeDtypeStruct(lse_shape, jnp.float32),
+            jax.ShapeDtypeStruct(out_accum_shape, jnp.float32),
+            jax.ShapeDtypeStruct(lse_accum_shape, jnp.float32),
+        ]
+
+        # Create empty arrays for optional inputs (size 0 to signal absent)
+        # element_count() == 0 means not present in C++ side
+        empty_i32 = jnp.array([], dtype=jnp.int32)
+        empty_f32 = jnp.array([], dtype=jnp.float32)
+        empty_like_q = jnp.zeros((0,), dtype=jax_dtype)
+
+        o, lse, _, _ = jax.ffi.ffi_call(
+            "flash_mha_fwd",
+            result_shape_dtypes=out_types,
+            has_side_effect=False,
+            input_layouts=[None] * 21,  # q, k, v, + 18 optional buffers
+            output_layouts=[None] * 4,
+        )(
+            q,
+            k,
+            v,
+            empty_like_q,  # k_new
+            empty_like_q,  # v_new
+            empty_like_q,  # q_v
+            empty_i32,  # cu_seqlens_q
+            empty_i32,  # cu_seqlens_k
+            empty_i32,  # cu_seqlens_k_new
+            empty_i32,  # seqused_q
+            empty_i32,  # seqused_k
+            empty_i32,  # page_table
+            empty_i32,  # kv_batch_idx
+            empty_i32,  # leftpad_k
+            empty_like_q,  # rotary_cos
+            empty_like_q,  # rotary_sin
+            empty_i32,  # seqlens_rotary
+            empty_f32,  # q_descale
+            empty_f32,  # k_descale
+            empty_f32,  # v_descale
+            empty_i32,  # scheduler_metadata
+            max_seqlen_q=l,
+            max_seqlen_q_has_value=True,
+            max_seqlen_k=lk,
+            max_seqlen_k_has_value=True,
+            softmax_scale_val=float(softmax_scale)
+            if softmax_scale is not None
+            else 1.0 / math.sqrt(d),
+            softmax_scale_has_value=True,
+            pack_gqa_val=False,
+            pack_gqa_has_value=False,
+            is_causal=is_causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            attention_chunk=0,
+            softcap=0.0,
+            is_rotary_interleaved=False,
+            num_splits=1,
+            sm_margin=0,
+        )
+
+        if dpad > 0:
+            o = o[:, :, :, :d]
+        return o, lse
+
+    return mlir.lower_fun(fwd, multiple_results=True)(ctx, q, k, v)
+
+
+mlir.register_lowering(
+    _flash_mha_fwd_hlo_p,
+    _flash_mha_fwd_hlo_lowering,  # type: ignore
+    platform="gpu",
+)
+
+
+def _flash_mha_bwd_hlo_lowering(
+    ctx, dout, q, k, v, out, lse, softmax_scale=None, is_causal=None, window_size=None
+):
+    dout_type = ir.RankedTensorType(dout.type).element_type
+    q_type = ir.RankedTensorType(q.type).element_type
+    k_type = ir.RankedTensorType(k.type).element_type
+    v_type = ir.RankedTensorType(v.type).element_type
+    out_type = ir.RankedTensorType(out.type).element_type
+    lse_type = ir.RankedTensorType(lse.type).element_type
+
+    assert type(q_type) in [ir.F16Type, ir.BF16Type]
+    assert q_type == dout_type
+    assert q_type == k_type
+    assert q_type == v_type
+    assert q_type == out_type
+    assert type(lse_type) in [ir.F32Type]
+    dtype = q_type
+
+    dout_shape = ir.RankedTensorType(dout.type).shape
+    q_shape = ir.RankedTensorType(q.type).shape
+    k_shape = ir.RankedTensorType(k.type).shape
+    v_shape = ir.RankedTensorType(v.type).shape
+    out_shape = ir.RankedTensorType(out.type).shape
+    lse_shape = ir.RankedTensorType(lse.type).shape
+    [n, lq, hq, d] = q_shape
+    [nk, lk, hk, dk] = k_shape
+    assert n == nk
+    assert d == dk
+    assert isinstance(window_size, (tuple, list))
+
+    assert list(
+        map(list, [dout_shape, q_shape, k_shape, v_shape, out_shape, lse_shape])
+    ) == [
+        [n, lq, hq, d],
+        [n, lq, hq, d],
+        [n, lk, hk, d],
+        [n, lk, hk, d],
+        [n, lq, hq, d],
+        [n, hq, lq],
+    ]
+
+    def fwd(dout, q, k, v, out, lse):
+        dpad = (8 - d % 8) % 8
+        if dpad > 0:
+            # We need padding. It's better to let xla's allocator handle it here than directly call cudaMalloc.
+            q = jnp.pad(q, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+            k = jnp.pad(k, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+            v = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+            out = jnp.pad(out, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+            dout = jnp.pad(dout, ((0, 0), (0, 0), (0, 0), (0, dpad)), "constant")
+
+        # The backward kernel creates internal buffers (softmax_lse_log2, dsoftmax_sum) that are
+        # written with stride based on seqlen_q_rounded (see flash_bwd_preprocess_kernel.h:234).
+        # We must allocate these output buffers with the rounded size.
+        seqlen_q_rounded = ((lq + 127) // 128) * 128  # Round up to multiple of 128
+
+        # For MQA/GQA, hq != hk. The kernel produces dk/dv with shape (n, lk, hk, d).
+        # We sum over the head dimension afterwards if needed.
+        jax_dtype = jnp.bfloat16 if type(dtype) == ir.BF16Type else jnp.float16
+        out_types = [
+            jax.ShapeDtypeStruct(
+                (n, lq, hq, d + dpad), jax_dtype
+            ),  # dq - use actual length lq
+            jax.ShapeDtypeStruct((n, lk, hk, d + dpad), jax_dtype),  # dk
+            jax.ShapeDtypeStruct((n, lk, hk, d + dpad), jax_dtype),  # dv
+            jax.ShapeDtypeStruct((n, hq, seqlen_q_rounded), jnp.float32),  # softmax_d
+            jax.ShapeDtypeStruct(
+                (n, hq, seqlen_q_rounded), jnp.float32
+            ),  # softmax_lse_log2
+        ]
+
+        # Create empty arrays for optional inputs (size 0 to signal absent)
+        empty_i32 = jnp.array([], dtype=jnp.int32)
+
+        dq, dk, dv, _, _ = jax.ffi.ffi_call(
+            "flash_mha_bwd",
+            result_shape_dtypes=out_types,
+            has_side_effect=False,
+            input_layouts=[None] * 10,  # dout, q, k, v, out, lse + 4 optional buffers
+            output_layouts=[None] * 5,
+        )(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            empty_i32,  # cu_seqlens_q
+            empty_i32,  # cu_seqlens_k
+            empty_i32,  # seqused_q
+            empty_i32,  # seqused_k
+            max_seqlen_q_val=lq,  # Actual sequence length for masking
+            max_seqlen_q_has_value=True,
+            max_seqlen_k_val=lk,
+            max_seqlen_k_has_value=True,
+            softmax_scale_val=float(softmax_scale)
+            if softmax_scale is not None
+            else 1.0 / math.sqrt(d),
+            softmax_scale_has_value=True,
+            is_causal=is_causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            softcap=0.0,
+            deterministic=False,
+            sm_margin=0,
+        )
+
+        # Unpad head dimension only (sequence dimension already has correct size)
+        if dpad > 0:
+            dq = dq[:, :, :, :d]
+            dk = dk[:, :, :, :d]
+            dv = dv[:, :, :, :d]
+
+        return dq, dk, dv
+
+    return mlir.lower_fun(fwd, multiple_results=True)(ctx, dout, q, k, v, out, lse)
+
+
+mlir.register_lowering(
+    _flash_mha_bwd_hlo_p,
+    _flash_mha_bwd_hlo_lowering,  # type: ignore
+    platform="gpu",
+)
+
+# ==== Abstract evaluation rules ====
+
+
+def _flash_mha_fwd_abstract(
+    q, k, v, softmax_scale=None, is_causal=None, window_size=None
+):
+    q_dtype = dtypes.canonicalize_dtype(q.dtype)
+    k_dtype = dtypes.canonicalize_dtype(k.dtype)
+    v_dtype = dtypes.canonicalize_dtype(v.dtype)
+    [n, l, h, d] = q.shape
+    assert q_dtype == k_dtype and q_dtype == v_dtype
+    assert q_dtype in [jnp.bfloat16, jnp.float16]
+    return (ShapedArray(q.shape, q_dtype), ShapedArray([n, h, l], jnp.float32))
+
+
+_flash_mha_fwd_hlo_p.def_abstract_eval(_flash_mha_fwd_abstract)
+
+
+def _flash_mha_bwd_abstract(
+    dout, q, k, v, out, lse, softmax_scale=None, is_causal=None, window_size=None
+):
+    dout_dtype = dtypes.canonicalize_dtype(dout.dtype)
+    q_dtype = dtypes.canonicalize_dtype(q.dtype)
+    k_dtype = dtypes.canonicalize_dtype(k.dtype)
+    v_dtype = dtypes.canonicalize_dtype(v.dtype)
+    out_dtype = dtypes.canonicalize_dtype(out.dtype)
+    dtypes.canonicalize_dtype(lse.dtype)
+    [n, lq, hq, d] = q.shape
+    assert len(set([dout_dtype, q_dtype, k_dtype, v_dtype, out_dtype])) == 1
+    assert q_dtype in [jnp.bfloat16, jnp.float16]
+    return (
+        ShapedArray(q.shape, q_dtype),
+        ShapedArray(k.shape, k_dtype),
+        ShapedArray(v.shape, v_dtype),
+    )
+
+
+_flash_mha_bwd_hlo_p.def_abstract_eval(_flash_mha_bwd_abstract)
