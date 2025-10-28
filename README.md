@@ -5,6 +5,7 @@ This library provides JAX bindings of [FlashAttention 3](https://github.com/Dao-
 - Causal masking and sliding window attention
 - Ring Attention
 - Variable length sequences within batches
+- KV cache with paged attention support
 
 ## Requirements
 
@@ -119,6 +120,148 @@ output = flash_mha_varlen(
     cu_seqlens_k=cu_seqlens,
     max_seqlen_q=1024,
     max_seqlen_k=1024
+)
+```
+
+### `flash_mha_with_kvcache`
+
+Flash attention with KV cache supporting both contiguous and paged cache modes.
+
+```python
+from flash_attn3_jax import flash_mha_with_kvcache
+
+flash_mha_with_kvcache(
+    q,                      # (batch, seqlen_q, h_q, d)
+    k_cache,                # Contiguous: (batch_cache, seqlen_cache, h_k, d)
+                            # Paged: (num_blocks, page_size, h_k, d)
+    v_cache,                # Same shape as k_cache
+    k=None,                 # Optional new keys: (batch, seqlen_new, h_k, d)
+    v=None,                 # Optional new values: (batch, seqlen_new, h_k, d)
+    cache_seqlens=None,     # int or (batch,) - length of valid cache data
+    cache_batch_idx=None,   # (batch,) - map query batch to cache batch
+    cache_leftpad=None,     # (batch,) - left padding per sequence
+    page_table=None,        # (batch, max_num_pages) - for paged KV cache
+    rotary_cos=None,        # (seqlen_ro, rotary_dim/2) - rotary embeddings
+    rotary_sin=None,        # (seqlen_ro, rotary_dim/2) - rotary embeddings
+    softmax_scale=None,     # default to 1/sqrt(d)
+    is_causal=False,
+    window_size=(-1, -1),
+    num_splits=1,
+    return_softmax_lse=False
+)
+```
+
+**Important notes:** the KV cache is **NOT** modified in-place (unlike PyTorch version).
+
+#### Basic KV Cache Usage
+
+```python
+import jax.numpy as jnp
+from flash_attn3_jax import flash_mha_with_kvcache
+
+batch_size = 4
+query_seqlen = 1  # Single token
+cache_seqlen = 2048
+num_heads_q = 32
+num_heads_kv = 8  # GQA with 4 groups
+head_dim = 128
+
+# Query for current token
+q = jnp.ones((batch_size, query_seqlen, num_heads_q, head_dim), dtype=jnp.float16)
+
+# Pre-filled KV cache from previous tokens
+k_cache = jnp.ones((batch_size, cache_seqlen, num_heads_kv, head_dim), dtype=jnp.float16)
+v_cache = jnp.ones((batch_size, cache_seqlen, num_heads_kv, head_dim), dtype=jnp.float16)
+
+# Varying cache lengths per batch item
+cache_seqlens = jnp.array([1024, 1536, 2048, 512], dtype=jnp.int32)
+
+# Run attention
+output = flash_mha_with_kvcache(
+    q=q,
+    k_cache=k_cache,
+    v_cache=v_cache,
+    cache_seqlens=cache_seqlens,
+    is_causal=True
+)
+```
+
+#### With new Keys/Values
+
+```python
+# Query tokens
+q = jnp.ones((batch_size, 8, num_heads_q, head_dim), dtype=jnp.float16)
+
+# New K/V to append to cache
+k_new = jnp.ones((batch_size, 8, num_heads_kv, head_dim), dtype=jnp.float16)
+v_new = jnp.ones((batch_size, 8, num_heads_kv, head_dim), dtype=jnp.float16)
+
+# Current cache length before appending
+cache_seqlens = jnp.array([1024, 1024, 1024, 1024], dtype=jnp.int32)
+
+# Attention includes both cache and new K/V
+output = flash_mha_with_kvcache(
+    q=q,
+    k_cache=k_cache,
+    v_cache=v_cache,
+    k=k_new,
+    v=v_new,
+    cache_seqlens=cache_seqlens,
+    is_causal=True
+)
+```
+
+#### Paged KV Cache
+
+```python
+page_size = 64  # Tokens per page/block
+num_blocks = 1000  # Total blocks in memory pool
+batch_size = 4
+max_pages_per_seq = 32  # Max pages/blocks allocated to each sequence, in this case 2048 tokens per sequence
+
+# Paged KV cache as a shared memory pool
+k_cache_paged = jnp.ones((num_blocks, page_size, num_heads_kv, head_dim), dtype=jnp.float16)
+v_cache_paged = jnp.ones((num_blocks, page_size, num_heads_kv, head_dim), dtype=jnp.float16)
+
+# Page table maps each sequence to its allocated blocks (shape: (batch, max_pages_per_seq))
+page_table = jnp.array([
+    [0, 1, 2, 3, ...],    # Sequence 0 uses blocks 0,1,2,3,...
+    [10, 15, 20, 25, ...], # Sequence 1 uses blocks 10,15,20,25,...
+    [5, 6, 7, 8, ...],    # Sequence 2 uses blocks 5,6,7,8,...
+    [30, 31, 32, 33, ...], # Sequence 3 uses blocks 30,31,32,33,...
+], dtype=jnp.int32)
+
+# Cache lengths must be divisible by page_size for paged mode
+cache_seqlens = jnp.array([512, 1024, 2048, 1536], dtype=jnp.int32)
+
+output = flash_mha_with_kvcache(
+    q=q,
+    k_cache=k_cache_paged,
+    v_cache=v_cache_paged,
+    cache_seqlens=cache_seqlens,
+    page_table=page_table,
+    is_causal=True
+)
+```
+
+**Paged cache requirements:**
+- `page_table` must have shape `(batch, max_num_pages_per_seq)`
+- Each page table entry contains the block index in the memory pool
+- `cache_seqlens` should be divisible by `page_size`
+
+#### Advanced Features
+
+**Batch index mapping**, map queries to different cache slots:
+```python
+# 3 queries but 5 cache slots
+cache_batch_idx = jnp.array([0, 2, 4], dtype=jnp.int32)
+
+output = flash_mha_with_kvcache(
+    q=q,  # Shape: (3, seqlen_q, h_q, d)
+    k_cache=k_cache,  # Shape: (5, seqlen_cache, h_k, d)
+    v_cache=v_cache,
+    cache_batch_idx=cache_batch_idx,
+    cache_seqlens=cache_seqlens
 )
 ```
 

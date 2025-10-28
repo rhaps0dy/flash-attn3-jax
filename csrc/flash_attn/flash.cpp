@@ -933,6 +933,25 @@ mha_fwd_impl(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device,
     auto pts = cute::compact_row_major(
         cute::make_shape(page_table_.dimensions()[0], page_table_.dimensions()[1]));
     params.page_table_batch_stride = cute::get<0>(pts);
+
+    // For paged KV cache, recalculate strides based on actual tensor shape
+    // k/v have shape (num_blocks, page_size, h_k, d) not (b, seqlen_k, h_k, d)
+    // Use negative indexing like PyTorch: stride(-3) = page_size stride, stride(-2) = h_k stride, etc.
+    auto k_dims = k.dimensions();
+    auto v_dims = v.dimensions();
+    auto k_paged_s = cute::compact_row_major(
+        cute::make_shape(k_dims[0], k_dims[1], k_dims[2], k_dims[3]));
+    auto v_paged_s = cute::compact_row_major(
+        cute::make_shape(v_dims[0], v_dims[1], v_dims[2], v_dims[3]));
+
+    // Override the strides that were incorrectly calculated in set_params_fprop
+    params.k_row_stride = cute::get<1>(k_paged_s);      // stride for page_size dim
+    params.v_row_stride = cute::get<1>(v_paged_s);      // stride for page_size dim
+    params.k_head_stride = cute::get<2>(k_paged_s);     // stride for h_k dim
+    params.v_head_stride = cute::get<2>(v_paged_s);     // stride for h_k dim
+    params.v_dim_stride = cute::get<3>(v_paged_s);      // stride for d dim
+    params.k_batch_stride = cute::get<0>(k_paged_s);    // stride for num_blocks dim
+    params.v_batch_stride = cute::get<0>(v_paged_s);    // stride for num_blocks dim
   }
   params.page_size = page_size;
   params.num_pages = num_pages;
