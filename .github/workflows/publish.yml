@@ -26,14 +26,23 @@ jobs:
           submodules: recursive  # Important: fetch CUTLASS submodule
       - name: Install system dependencies
         run: |
-          apt-get install -y python3.11 python3.11-dev python3.11-venv python3-pip
+          apt-get install -y python3.11 python3.11-dev python3.11-venv python3-pip ccache
           update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-cuda-${{ hashFiles('csrc/**') }}
+          restore-keys: |
+            ccache-cuda-
+
       - name: Install uv
         run: |
           pip install uv
       - name: Build wheel
         run: |
-          CMAKE_BUILD_PARALLEL_LEVEL=32 uv build --wheel
+          CMAKE_BUILD_PARALLEL_LEVEL=4 uv build --wheel
         env:
           FLASH_ATTN_CUDA_ARCHS: '90'  # Hopper only by default
       - name: Upload wheel artifact
