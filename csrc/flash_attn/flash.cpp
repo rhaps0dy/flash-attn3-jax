@@ -425,7 +425,8 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
     }
   }
 #else
-  FFI_CHECK(false) << "This flash attention build does not support combine kernels.";
+  // FFI_CHECK can't be used in void functions - use assert instead
+  assert(false && "This flash attention build does not support combine kernels.");
 #endif
 }
 
@@ -1215,7 +1216,8 @@ mha_fwd_impl(cudaStream_t stream, ffi::ScratchAllocator scratch, int32_t device,
 
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-  FFI_CHECK(false) << "Flash-Attention was built with backward disabled";
+  // FFI_CHECK can't be used in void functions - use assert instead
+  assert(false && "Flash-Attention was built with backward disabled");
 }
 #else
 template <int Arch, bool Has_softcap>
@@ -1248,7 +1250,8 @@ void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
     }
 #endif
 #else
-    FFI_CHECK(false) << "This flash attention build does not support FP16.";
+    // FFI_CHECK can't be used in void functions - use assert instead
+    assert(false && "This flash attention build does not support FP16.");
 #endif
   } else {
 #ifndef FLASHATTENTION_DISABLE_HDIM64

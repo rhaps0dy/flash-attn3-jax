@@ -222,6 +222,8 @@ set(FLASH_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/flash_attn/src
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/cutlass/include
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    # XLA FFI headers from parent project
+    ${CMAKE_CURRENT_SOURCE_DIR}/../xla
 )
 
 file(GLOB CC_SOURCES "csrc/flash_attn/*.cpp" "csrc/flash_attn/src/*.cpp")
@@ -369,6 +371,7 @@ if(NOT IS_SM90_ENABLED EQUAL -1)
     endif()
 
     if(FLASHATTENTION_DISABLE_FP16)
+        list(FILTER SM90_SOURCES EXCLUDE REGEX ".*_fp16_sm90\\.cu$")
         list(FILTER SM90_SOURCES EXCLUDE REGEX ".*_fp16_.*_sm90\\.cu$")
     endif()
 
